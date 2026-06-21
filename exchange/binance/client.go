@@ -2,197 +2,214 @@ package binance
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"net/url"
 	"strconv"
+	"strings"
+
+	futuresclient "github.com/binance/binance-connector-go/clients/derivativestradingusdsfutures"
+	futuresmodels "github.com/binance/binance-connector-go/clients/derivativestradingusdsfutures/src/restapi/models"
+	spotclient "github.com/binance/binance-connector-go/clients/spot"
+	spotmodels "github.com/binance/binance-connector-go/clients/spot/src/restapi/models"
+	"github.com/binance/binance-connector-go/common/v2/common"
 
 	"github.com/GeekChomolungma/ChomoExecutor/model"
 )
 
-const (
-	spotBaseURL    = "https://api.binance.com"
-	futuresBaseURL = "https://fapi.binance.com"
-)
-
-// SpotClient calls the Binance Spot REST API (/api/v3/...).
+// SpotClient implements exchange.Exchange for Binance Spot via the official connector.
 type SpotClient struct {
-	baseClient
+	api *spotclient.BinanceSpotClient
 }
 
 func NewSpotClient(apiKey, secretKey string) *SpotClient {
-	return &SpotClient{newBaseClient(apiKey, secretKey, spotBaseURL)}
+	cfg := common.NewConfigurationRestAPI(
+		common.WithBasePath(common.SpotRestApiProdUrl),
+		common.WithApiKey(apiKey),
+		common.WithApiSecret(secretKey),
+	)
+	return &SpotClient{
+		api: spotclient.NewBinanceSpotClient(spotclient.WithRestAPI(cfg)),
+	}
 }
 
 func (c *SpotClient) PlaceOrder(ctx context.Context, order *model.OrderRequest) (*model.OrderResult, error) {
-	side, err := toSide(order.Side)
+	side, err := toSpotSide(order.Side)
+	if err != nil {
+		return nil, err
+	}
+	orderType, err := toSpotType(order.OrderType)
 	if err != nil {
 		return nil, err
 	}
 
-	params := url.Values{}
-	params.Set("symbol", order.Symbol)
-	params.Set("side", side)
-	params.Set("type", order.OrderType)
-	params.Set("quantity", fmtQty(order.Quantity))
-	params.Set("newOrderRespType", "RESULT")
+	req := c.api.RestApi.TradeAPI.NewOrder(ctx).
+		Symbol(order.Symbol).
+		Side(side).
+		Type(orderType).
+		Quantity(float32(order.Quantity)).
+		NewOrderRespType(spotmodels.NewOrderNewOrderRespTypeParameterResult)
+
 	if order.OrderType == "LIMIT" {
-		params.Set("price", fmtPrice(order.Price))
-		params.Set("timeInForce", "GTC")
+		req = req.
+			Price(float32(order.Price)).
+			TimeInForce(spotmodels.NewOrderTimeInForceParameterGtc)
 	}
 
-	body, err := c.signedPOST(ctx, "/api/v3/order", params)
+	resp, err := req.Execute()
 	if err != nil {
 		return nil, fmt.Errorf("spot PlaceOrder: %w", err)
 	}
-	return parseOrderResult(body)
+
+	d := resp.Data
+	filledQty, _ := strconv.ParseFloat(d.GetExecutedQty(), 64)
+
+	// MARKET orders return price="0"; derive avg from cummulative quote qty
+	var avgPrice float64
+	if p := d.GetPrice(); p != "" && p != "0" {
+		avgPrice, _ = strconv.ParseFloat(p, 64)
+	} else if filledQty > 0 {
+		if cumQ, _ := strconv.ParseFloat(d.GetCummulativeQuoteQty(), 64); cumQ > 0 {
+			avgPrice = cumQ / filledQty
+		}
+	}
+
+	return &model.OrderResult{
+		OrderID:   strconv.FormatInt(d.GetOrderId(), 10),
+		Symbol:    d.GetSymbol(),
+		Status:    d.GetStatus(),
+		FilledQty: filledQty,
+		AvgPrice:  avgPrice,
+	}, nil
 }
 
 func (c *SpotClient) GetPrice(ctx context.Context, symbol string) (float64, error) {
-	params := url.Values{}
-	params.Set("symbol", symbol)
-	body, err := c.publicGET(ctx, "/api/v3/ticker/price", params)
+	resp, err := c.api.RestApi.MarketAPI.TickerPrice(ctx).Symbol(symbol).Execute()
 	if err != nil {
 		return 0, fmt.Errorf("spot GetPrice: %w", err)
 	}
-	return parsePriceResponse(body)
+
+	r1 := resp.Data.TickerPriceResponse1
+	if r1 == nil {
+		return 0, fmt.Errorf("spot GetPrice: unexpected response type for symbol %s", symbol)
+	}
+
+	price, err := strconv.ParseFloat(r1.GetPrice(), 64)
+	if err != nil {
+		return 0, fmt.Errorf("spot GetPrice parse: %w", err)
+	}
+	return price, nil
 }
 
 func (c *SpotClient) GetBalance(ctx context.Context, asset string) (float64, error) {
-	body, err := c.signedGET(ctx, "/api/v3/account", url.Values{})
+	resp, err := c.api.RestApi.AccountAPI.GetAccount(ctx).Execute()
 	if err != nil {
 		return 0, fmt.Errorf("spot GetBalance: %w", err)
 	}
 
-	var resp struct {
-		Balances []struct {
-			Asset string `json:"asset"`
-			Free  string `json:"free"`
-		} `json:"balances"`
-	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return 0, fmt.Errorf("spot GetBalance parse: %w", err)
-	}
-	for _, b := range resp.Balances {
-		if b.Asset == asset {
-			bal, _ := strconv.ParseFloat(b.Free, 64)
+	for _, b := range resp.Data.Balances {
+		if b.GetAsset() == asset {
+			bal, _ := strconv.ParseFloat(b.GetFree(), 64)
 			return bal, nil
 		}
 	}
 	return 0, fmt.Errorf("spot GetBalance: asset %s not found", asset)
 }
 
-// FuturesClient calls the Binance USDM Futures REST API (/fapi/v1/...).
+// FuturesClient implements exchange.Exchange for Binance USDS-M Futures via the official connector.
 type FuturesClient struct {
-	baseClient
+	api *futuresclient.BinanceDerivativesTradingUsdsFuturesClient
 }
 
 func NewFuturesClient(apiKey, secretKey string) *FuturesClient {
-	return &FuturesClient{newBaseClient(apiKey, secretKey, futuresBaseURL)}
+	cfg := common.NewConfigurationRestAPI(
+		common.WithBasePath(common.DerivativesTradingUsdsFuturesRestApiProdUrl),
+		common.WithApiKey(apiKey),
+		common.WithApiSecret(secretKey),
+	)
+	return &FuturesClient{
+		api: futuresclient.NewBinanceDerivativesTradingUsdsFuturesClient(futuresclient.WithRestAPI(cfg)),
+	}
 }
 
 func (c *FuturesClient) PlaceOrder(ctx context.Context, order *model.OrderRequest) (*model.OrderResult, error) {
-	side, err := toSide(order.Side)
+	side, err := toFuturesSide(order.Side)
 	if err != nil {
 		return nil, err
 	}
 
-	params := url.Values{}
-	params.Set("symbol", order.Symbol)
-	params.Set("side", side)
-	params.Set("positionSide", order.PositionSide)
-	params.Set("type", order.OrderType)
-	params.Set("quantity", fmtQty(order.Quantity))
-	params.Set("newOrderRespType", "RESULT")
+	req := c.api.RestApi.TradeAPI.NewOrder(ctx).
+		Symbol(order.Symbol).
+		Side(side).
+		Type(strings.ToUpper(order.OrderType)).
+		Quantity(float32(order.Quantity)).
+		NewOrderRespType(futuresmodels.NewAlgoOrderNewOrderRespTypeParameterResult)
+
+	if order.PositionSide != "" {
+		ps, err := toFuturesPositionSide(order.PositionSide)
+		if err != nil {
+			return nil, err
+		}
+		req = req.PositionSide(ps)
+	}
 	if order.ReduceOnly {
-		params.Set("reduceOnly", "true")
+		req = req.ReduceOnly("true")
 	}
 	if order.OrderType == "LIMIT" {
-		params.Set("price", fmtPrice(order.Price))
-		params.Set("timeInForce", "GTC")
+		req = req.
+			Price(float32(order.Price)).
+			TimeInForce(futuresmodels.NewAlgoOrderTimeInForceParameterGtc)
 	}
 
-	body, err := c.signedPOST(ctx, "/fapi/v1/order", params)
+	resp, err := req.Execute()
 	if err != nil {
 		return nil, fmt.Errorf("futures PlaceOrder: %w", err)
 	}
-	return parseOrderResult(body)
-}
 
-func (c *FuturesClient) GetPrice(ctx context.Context, symbol string) (float64, error) {
-	params := url.Values{}
-	params.Set("symbol", symbol)
-	body, err := c.publicGET(ctx, "/fapi/v1/ticker/price", params)
-	if err != nil {
-		return 0, fmt.Errorf("futures GetPrice: %w", err)
-	}
-	return parsePriceResponse(body)
-}
-
-func (c *FuturesClient) GetBalance(ctx context.Context, asset string) (float64, error) {
-	body, err := c.signedGET(ctx, "/fapi/v2/account", url.Values{})
-	if err != nil {
-		return 0, fmt.Errorf("futures GetBalance: %w", err)
-	}
-
-	var resp struct {
-		Assets []struct {
-			Asset            string `json:"asset"`
-			AvailableBalance string `json:"availableBalance"`
-		} `json:"assets"`
-	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return 0, fmt.Errorf("futures GetBalance parse: %w", err)
-	}
-	for _, a := range resp.Assets {
-		if a.Asset == asset {
-			bal, _ := strconv.ParseFloat(a.AvailableBalance, 64)
-			return bal, nil
-		}
-	}
-	return 0, fmt.Errorf("futures GetBalance: asset %s not found", asset)
-}
-
-// --- shared response parsers ---
-
-func parseOrderResult(body []byte) (*model.OrderResult, error) {
-	var resp struct {
-		OrderID     int64  `json:"orderId"`
-		Symbol      string `json:"symbol"`
-		Status      string `json:"status"`
-		ExecutedQty string `json:"executedQty"`
-		AvgPrice    string `json:"avgPrice"`
-		Price       string `json:"price"`
-	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, fmt.Errorf("parseOrderResult: %w", err)
-	}
-	filledQty, _ := strconv.ParseFloat(resp.ExecutedQty, 64)
-	// futures returns avgPrice; spot returns price
-	rawPrice := resp.AvgPrice
+	d := resp.Data
+	filledQty, _ := strconv.ParseFloat(d.GetExecutedQty(), 64)
+	rawPrice := d.GetAvgPrice()
 	if rawPrice == "" || rawPrice == "0" {
-		rawPrice = resp.Price
+		rawPrice = d.GetPrice()
 	}
 	avgPrice, _ := strconv.ParseFloat(rawPrice, 64)
+
 	return &model.OrderResult{
-		OrderID:   strconv.FormatInt(resp.OrderID, 10),
-		Symbol:    resp.Symbol,
-		Status:    resp.Status,
+		OrderID:   strconv.FormatInt(d.GetOrderId(), 10),
+		Symbol:    d.GetSymbol(),
+		Status:    d.GetStatus(),
 		FilledQty: filledQty,
 		AvgPrice:  avgPrice,
 	}, nil
 }
 
-func parsePriceResponse(body []byte) (float64, error) {
-	var resp struct {
-		Price string `json:"price"`
-	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return 0, fmt.Errorf("parsePriceResponse: %w", err)
-	}
-	price, err := strconv.ParseFloat(resp.Price, 64)
+func (c *FuturesClient) GetPrice(ctx context.Context, symbol string) (float64, error) {
+	resp, err := c.api.RestApi.MarketDataAPI.SymbolPriceTickerV2(ctx).Symbol(symbol).Execute()
 	if err != nil {
-		return 0, fmt.Errorf("parsePriceResponse convert: %w", err)
+		return 0, fmt.Errorf("futures GetPrice: %w", err)
+	}
+
+	r1 := resp.Data.SymbolPriceTickerV2Response1
+	if r1 == nil {
+		return 0, fmt.Errorf("futures GetPrice: unexpected response type for symbol %s", symbol)
+	}
+
+	price, err := strconv.ParseFloat(r1.GetPrice(), 64)
+	if err != nil {
+		return 0, fmt.Errorf("futures GetPrice parse: %w", err)
 	}
 	return price, nil
+}
+
+func (c *FuturesClient) GetBalance(ctx context.Context, asset string) (float64, error) {
+	resp, err := c.api.RestApi.AccountAPI.FuturesAccountBalanceV3(ctx).Execute()
+	if err != nil {
+		return 0, fmt.Errorf("futures GetBalance: %w", err)
+	}
+
+	for _, b := range resp.Data.Items {
+		if b.GetAsset() == asset {
+			bal, _ := strconv.ParseFloat(b.GetAvailableBalance(), 64)
+			return bal, nil
+		}
+	}
+	return 0, fmt.Errorf("futures GetBalance: asset %s not found", asset)
 }
