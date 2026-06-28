@@ -54,7 +54,7 @@ func main() {
 	signalHandler := handler.NewSignalHandler(executor, cfg.AuthUID)
 	router := api.NewRouter(signalHandler)
 
-	addr := ":" + cfg.Port
+	addr := cfg.Host + ":" + cfg.Port
 	log.Printf("[main] ChomoExecutor listening on %s", addr)
 	if err := router.Run(addr); err != nil {
 		log.Fatalf("[main] server error: %v", err)
