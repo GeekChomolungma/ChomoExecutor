@@ -3,22 +3,25 @@ package service
 import (
 	"context"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 
 	"github.com/GeekChomolungma/ChomoExecutor/exchange"
 	"github.com/GeekChomolungma/ChomoExecutor/model"
+	"github.com/GeekChomolungma/ChomoExecutor/store"
 )
 
 // Executor is the core business layer. It holds a registry of exchanges keyed
 // by "venue_markettype" (e.g. "binance_futures", "okx_spot") so any combination
 // can be added without touching this file.
 type Executor struct {
-	exchanges map[string]exchange.Exchange
+	exchanges  map[string]exchange.Exchange
+	orderStore store.OrderStore // nil means persistence is disabled
 }
 
-func NewExecutor(exchanges map[string]exchange.Exchange) *Executor {
-	return &Executor{exchanges: exchanges}
+func NewExecutor(exchanges map[string]exchange.Exchange, orderStore store.OrderStore) *Executor {
+	return &Executor{exchanges: exchanges, orderStore: orderStore}
 }
 
 // RegisterKey builds the lookup key used in the exchange registry.
@@ -26,7 +29,7 @@ func RegisterKey(venue, marketType string) string {
 	return strings.ToLower(venue) + "_" + strings.ToLower(marketType)
 }
 
-// Execute validates the signal, resolves quantity, then places the order.
+// Execute validates the signal, resolves quantity, places the order, and persists the result.
 func (e *Executor) Execute(ctx context.Context, sig *model.Signal) (*model.OrderResult, error) {
 	ex, err := e.selectExchange(sig.Exchange, sig.MarketType)
 	if err != nil {
@@ -42,6 +45,16 @@ func (e *Executor) Execute(ctx context.Context, sig *model.Signal) (*model.Order
 	if err != nil {
 		return nil, fmt.Errorf("executor place order: %w", err)
 	}
+
+	// Persist best-effort: a DB failure must not be confused with an order failure,
+	// as the order was already submitted to the exchange.
+	if e.orderStore != nil {
+		record := store.NewOrderRecord(sig, order, result)
+		if saveErr := e.orderStore.SaveOrderResult(ctx, record); saveErr != nil {
+			log.Printf("[executor] persist order result failed (orderID=%s): %v", result.OrderID, saveErr)
+		}
+	}
+
 	return result, nil
 }
 

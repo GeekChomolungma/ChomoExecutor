@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 
 	"github.com/GeekChomolungma/ChomoExecutor/api"
@@ -10,6 +11,8 @@ import (
 	binance "github.com/GeekChomolungma/ChomoExecutor/exchange/binance"
 	"github.com/GeekChomolungma/ChomoExecutor/exchange/mock"
 	"github.com/GeekChomolungma/ChomoExecutor/service"
+	"github.com/GeekChomolungma/ChomoExecutor/store"
+	mongostore "github.com/GeekChomolungma/ChomoExecutor/store/mongo"
 )
 
 func main() {
@@ -35,7 +38,19 @@ func main() {
 	// To add a new exchange (e.g. OKX), implement exchange.Exchange and register here:
 	// exchanges[service.RegisterKey("okx", "spot")] = okx.NewSpotClient(...)
 
-	executor := service.NewExecutor(exchanges)
+	var orderStore store.OrderStore
+	if cfg.MongoURI != "" {
+		var err error
+		orderStore, err = mongostore.New(context.Background(), cfg.MongoURI)
+		if err != nil {
+			log.Fatalf("[main] MongoDB connect failed: %v", err)
+		}
+		log.Println("[main] MongoDB persistence enabled")
+	} else {
+		log.Println("[main] No MONGO_URI -- order persistence disabled")
+	}
+
+	executor := service.NewExecutor(exchanges, orderStore)
 	signalHandler := handler.NewSignalHandler(executor, cfg.AuthUID)
 	router := api.NewRouter(signalHandler)
 

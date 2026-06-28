@@ -10,6 +10,8 @@ type Config struct {
 	BinanceBaseURL string
 	// UID used to authenticate incoming webhook signals
 	AuthUID string
+	// MongoDB connection URI; empty means persistence is disabled
+	MongoURI string
 }
 
 func Load() *Config {
@@ -19,6 +21,7 @@ func Load() *Config {
 		BinanceSecretKey: env("BINANCE_SECRET_KEY", ""),
 		BinanceBaseURL:   env("BINANCE_BASE_URL", "https://fapi.binance.com"),
 		AuthUID:          env("AUTH_UID", ""),
+		MongoURI:         env("MONGO_URI", ""),
 	}
 }
 
